@@ -161,76 +161,28 @@ static int __init sched_fair_sysctl_init(void)
 late_initcall(sched_fair_sysctl_init);
 #endif
 
-/* -------- Per-user CPU accounting for equitable scheduling -------- */
-#define USER_STATS_MAX 64
+/* ---- Equitable per-user CPU scheduling ---- */
+#define FAIR_USER_TABLE_SIZE 64
 
-struct user_cpu_stat {
-    atomic_t    in_use;
-    uid_t       uid;
-    atomic64_t  runtime_ns;
-    atomic_t    task_count;
-};
+static u64      per_user_runtime[FAIR_USER_TABLE_SIZE];
+static uid_t    user_uid_table[FAIR_USER_TABLE_SIZE];
+static int      active_user_count;
+static DEFINE_SPINLOCK(fair_user_lock);
 
-static struct user_cpu_stat user_cpu_stats[USER_STATS_MAX];
-static atomic_t user_decay_tick = ATOMIC_INIT(0);
-
-static struct user_cpu_stat *find_user_stat(uid_t uid)
+static int lookup_or_register_user(uid_t uid)
 {
     int i;
-    for (i = 0; i < USER_STATS_MAX; i++) {
-        if (atomic_read(&user_cpu_stats[i].in_use) &&
-            user_cpu_stats[i].uid == uid)
-            return &user_cpu_stats[i];
+    for (i = 0; i < active_user_count; i++)
+        if (user_uid_table[i] == uid)
+            return i;
+    if (active_user_count < FAIR_USER_TABLE_SIZE) {
+        user_uid_table[active_user_count] = uid;
+        per_user_runtime[active_user_count] = 0;
+        return active_user_count++;
     }
-    return NULL;
+    return -1;
 }
-
-static struct user_cpu_stat *find_or_create_user_stat(uid_t uid)
-{
-    int i;
-
-    for (i = 0; i < USER_STATS_MAX; i++) {
-        if (atomic_read(&user_cpu_stats[i].in_use) &&
-            user_cpu_stats[i].uid == uid)
-            return &user_cpu_stats[i];
-    }
-
-    for (i = 0; i < USER_STATS_MAX; i++) {
-        if (!atomic_read(&user_cpu_stats[i].in_use)) {
-            user_cpu_stats[i].uid = uid;
-            atomic64_set(&user_cpu_stats[i].runtime_ns, 0);
-            atomic_set(&user_cpu_stats[i].task_count, 0);
-            smp_wmb();
-            atomic_set(&user_cpu_stats[i].in_use, 1);
-            return &user_cpu_stats[i];
-        }
-    }
-    return NULL;
-}
-
-/*
- * Returns the minimum runtime among all active users with UID >= 1000.
- * Returns 0 if fewer than 2 users are active (no fairness needed).
- */
-static u64 get_min_user_runtime(void)
-{
-    u64 min = U64_MAX;
-    int count = 0;
-    int i;
-
-    for (i = 0; i < USER_STATS_MAX; i++) {
-        if (atomic_read(&user_cpu_stats[i].in_use)) {
-            u64 val = (u64)atomic64_read(&user_cpu_stats[i].runtime_ns);
-            if (val < min)
-                min = val;
-            count++;
-        }
-    }
-    if (count < 2)
-        return 0;
-    return min;
-}
-/* ------------------------------------------------------------------ */
+/* ------------------------------------------- */
 
 static inline void update_load_add(struct load_weight *lw, unsigned long inc)
 {
@@ -1293,13 +1245,17 @@ static void update_curr(struct cfs_rq *cfs_rq)
 		struct task_struct *p = task_of(curr);
 
 		update_curr_task(p, delta_exec);
-		
-		/* NEW: track per-user runtime for equitable scheduling */
+
+		/* NEW: accumulate per-user runtime and decay if needed */
 		if (task_uid(p).val >= 1000) {
-			struct user_cpu_stat *stat =
-				find_or_create_user_stat(task_uid(p).val);
-			if (stat)
-				atomic64_add(delta_exec, &stat->runtime_ns);
+			unsigned long lflags;
+			int slot;
+			spin_lock_irqsave(&fair_user_lock, lflags);
+			slot = lookup_or_register_user(task_uid(p).val);
+			if (slot >= 0) {
+				per_user_runtime[slot] += delta_exec;
+			}
+			spin_unlock_irqrestore(&fair_user_lock, lflags);
 		}
 
 		/*
@@ -5427,6 +5383,31 @@ place_entity(struct cfs_rq *cfs_rq, struct sched_entity *se, int flags)
 
 	se->vruntime = vruntime - lag;
 
+	/* NEW: one-time capped enqueue penalty for over-served users */
+	if (entity_is_task(se) && active_user_count > 1) {
+		struct task_struct *p = task_of(se);
+		uid_t uid = task_uid(p).val;
+		if (uid >= 1000) {
+			unsigned long lflags;
+			u64 total_rt = 0;
+			u64 mean_rt = 0;
+			int slot, k;
+			spin_lock_irqsave(&fair_user_lock, lflags);
+			slot = lookup_or_register_user(uid);
+			if (slot >= 0) {
+				for (k = 0; k < active_user_count; k++)
+					total_rt += per_user_runtime[k];
+				mean_rt = div64_u64(total_rt, active_user_count);
+				if (per_user_runtime[slot] > mean_rt) {
+					u64 surplus = per_user_runtime[slot] - mean_rt;
+					u64 ceiling = (u64)sysctl_sched_base_slice * 8;
+					se->vruntime += min(surplus, ceiling);
+				}
+			}
+			spin_unlock_irqrestore(&fair_user_lock, lflags);
+		}
+	}
+
 	if (sched_feat(PLACE_REL_DEADLINE) && se->rel_deadline) {
 		se->deadline += se->vruntime;
 		se->rel_deadline = 0;
@@ -5792,9 +5773,34 @@ entity_tick(struct cfs_rq *cfs_rq, struct sched_entity *curr, int queued)
 	 * don't let the period tick interfere with the hrtick preemption
 	 */
 	if (!sched_feat(DOUBLE_TICK) &&
-			hrtimer_active(&rq_of(cfs_rq)->hrtick_timer))
-		return;
-#endif
+				hrtimer_active(&rq_of(cfs_rq)->hrtick_timer))
+			return;
+	#endif
+
+	/* NEW: continuous gentle penalty per tick for over-served users */
+	if (entity_is_task(curr) && active_user_count > 1) {
+		struct task_struct *p = task_of(curr);
+		uid_t uid = task_uid(p).val;
+		if (uid >= 1000) {
+			unsigned long lflags;
+			u64 total_rt = 0;
+			u64 mean_rt = 0;
+			int slot, k;
+			spin_lock_irqsave(&fair_user_lock, lflags);
+			slot = lookup_or_register_user(uid);
+			if (slot >= 0) {
+				for (k = 0; k < active_user_count; k++)
+					total_rt += per_user_runtime[k];
+				mean_rt = div64_u64(total_rt, active_user_count);
+				if (per_user_runtime[slot] > mean_rt) {
+					u64 surplus = per_user_runtime[slot] - mean_rt;
+					curr->vruntime += surplus >> 6;
+					resched_curr(rq_of(cfs_rq));
+				}
+			}
+			spin_unlock_irqrestore(&fair_user_lock, lflags);
+		}
+	}
 }
 
 
@@ -8855,18 +8861,6 @@ static void task_dead_fair(struct task_struct *p)
 	}
 
 	remove_entity_load_avg(se);
-
-	/* NEW: decrement task count and free slot if last task for this user */
-	if (task_uid(p).val >= 1000) {
-		struct user_cpu_stat *stat = find_user_stat(task_uid(p).val);
-		if (stat) {
-			if (atomic_dec_and_test(&stat->task_count)) {
-				atomic64_set(&stat->runtime_ns, 0);
-				smp_wmb();
-				atomic_set(&stat->in_use, 0);
-			}
-		}
-	}
 }
 
 /*
@@ -9058,65 +9052,7 @@ again:
 	if (!p)
 		goto idle;
 	se = &p->se;
-	/*
-	 * NEW: Strategy 1 greedy user prioritization.
-	 * If the picked task belongs to an over-served user and a task
-	 * from the most under-served user exists on this run queue,
-	 * override CFS's pick to enforce equitable CPU distribution.
-	 * Only activates under CPU scarcity (more tasks than CPUs).
-	 */
-	if (entity_is_task(se) && nr_running() > num_online_cpus()) {
-		uid_t picked_uid = task_uid(p).val;
 
-		if (picked_uid >= 1000) {
-			u64 min_runtime = get_min_user_runtime();
-
-			if (min_runtime > 0) {
-				struct user_cpu_stat *picked_stat =
-					find_user_stat(picked_uid);
-
-				if (picked_stat &&
-				    atomic64_read(&picked_stat->runtime_ns)
-				    > min_runtime) {
-					/*
-					 * Picked user is over-served.
-					 * Walk the rb-tree to find a task
-					 * from the most under-served user.
-					 */
-					struct rb_node *node;
-					for (node = rb_first_cached(
-						&rq->cfs.tasks_timeline);
-					     node; node = rb_next(node)) {
-						struct sched_entity *cse =
-							rb_entry(node,
-							struct sched_entity,
-							run_node);
-						if (!entity_is_task(cse))
-							continue;
-						struct task_struct *ct =
-							task_of(cse);
-						if (ct == p)
-							continue;
-						uid_t cuid = task_uid(ct).val;
-						if (cuid < 1000)
-							continue;
-						struct user_cpu_stat *cstat =
-							find_user_stat(cuid);
-						if (!cstat)
-							continue;
-						if (atomic64_read(
-							&cstat->runtime_ns)
-							<= min_runtime) {
-							p = ct;
-							se = &p->se;
-							break;
-						}
-					}
-				}
-			}
-		}
-	}
-	/* END NEW */
 #ifdef CONFIG_FAIR_GROUP_SCHED
 	if (prev->sched_class != &fair_sched_class)
 		goto simple;
@@ -13353,24 +13289,6 @@ static void task_tick_fair(struct rq *rq, struct task_struct *curr, int queued)
 	check_update_overutilized_status(task_rq(curr));
 
 	task_tick_core(rq, curr);
-
-	/*
-	 * NEW: periodic reset of per-user runtime counters.
-	 * Reset rather than decay keeps each window independent,
-	 * preventing unbounded accumulation across measurement periods.
-	 * Use num_online_cpus() to correct for per-task firing rate.
-	 */
-	if (atomic_inc_return(&user_decay_tick) >= (HZ * num_online_cpus())) {
-		if (atomic_cmpxchg(&user_decay_tick,
-				   atomic_read(&user_decay_tick), 0)
-				   >= (HZ * num_online_cpus())) {
-			int i;
-			for (i = 0; i < USER_STATS_MAX; i++) {
-				if (atomic_read(&user_cpu_stats[i].in_use))
-					atomic64_set(&user_cpu_stats[i].runtime_ns, 0);
-			}
-		}
-	}
 }
 
 /*
@@ -13381,14 +13299,6 @@ static void task_tick_fair(struct rq *rq, struct task_struct *curr, int queued)
 static void task_fork_fair(struct task_struct *p)
 {
 	set_task_max_allowed_capacity(p);
-
-	/* NEW: register task against its user's stat entry */
-	if (task_uid(p).val >= 1000) {
-		struct user_cpu_stat *stat =
-			find_or_create_user_stat(task_uid(p).val);
-		if (stat)
-			atomic_inc(&stat->task_count);
-	}
 }
 
 /*
