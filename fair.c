@@ -163,7 +163,6 @@ late_initcall(sched_fair_sysctl_init);
 
 /* -------- Per-user CPU accounting for equitable scheduling -------- */
 #define USER_STATS_MAX 64
-#define USER_DECAY_SHIFT  1           
 
 struct user_cpu_stat {
     atomic_t    in_use;
@@ -13319,10 +13318,8 @@ static void task_tick_fair(struct rq *rq, struct task_struct *curr, int queued)
 			int i;
 			for (i = 0; i < USER_STATS_MAX; i++) {
 				if (atomic_read(&user_cpu_stats[i].in_use)) {
-					u64 val = (u64)atomic64_read(
-                                            &user_cpu_stats[i].runtime_ns);
-					atomic64_set(&user_cpu_stats[i].runtime_ns,
-						     val >> USER_DECAY_SHIFT);
+					atomic64_set(&user_cpu_stats[i].runtime_ns, 0);
+
 				}
 			}
 		}
