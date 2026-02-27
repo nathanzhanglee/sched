@@ -168,11 +168,10 @@ struct user_cpu_stat {
     atomic_t    in_use;
     uid_t       uid;
     atomic64_t  runtime_ns;
-    atomic_t    task_count;  /* NEW: number of living tasks for this user */
+    atomic_t    task_count;
 };
 
 static struct user_cpu_stat user_cpu_stats[USER_STATS_MAX];
-
 static atomic_t user_decay_tick = ATOMIC_INIT(0);
 
 static struct user_cpu_stat *find_user_stat(uid_t uid)
@@ -190,14 +189,12 @@ static struct user_cpu_stat *find_or_create_user_stat(uid_t uid)
 {
     int i;
 
-    /* Check if entry already exists */
     for (i = 0; i < USER_STATS_MAX; i++) {
         if (atomic_read(&user_cpu_stats[i].in_use) &&
             user_cpu_stats[i].uid == uid)
             return &user_cpu_stats[i];
     }
 
-    /* Create a new entry in the first free slot */
     for (i = 0; i < USER_STATS_MAX; i++) {
         if (!atomic_read(&user_cpu_stats[i].in_use)) {
             user_cpu_stats[i].uid = uid;
@@ -208,25 +205,30 @@ static struct user_cpu_stat *find_or_create_user_stat(uid_t uid)
             return &user_cpu_stats[i];
         }
     }
-
     return NULL;
 }
 
-static u64 get_avg_user_runtime(void)
+/*
+ * Returns the minimum runtime among all active users with UID >= 1000.
+ * Returns 0 if fewer than 2 users are active (no fairness needed).
+ */
+static u64 get_min_user_runtime(void)
 {
-    u64 total = 0;
+    u64 min = U64_MAX;
     int count = 0;
     int i;
 
     for (i = 0; i < USER_STATS_MAX; i++) {
         if (atomic_read(&user_cpu_stats[i].in_use)) {
-            total += (u64)atomic64_read(&user_cpu_stats[i].runtime_ns);
+            u64 val = (u64)atomic64_read(&user_cpu_stats[i].runtime_ns);
+            if (val < min)
+                min = val;
             count++;
         }
     }
-    if (count == 0)
+    if (count < 2)
         return 0;
-    return div_u64(total, count);
+    return min;
 }
 /* ------------------------------------------------------------------ */
 
@@ -1291,28 +1293,15 @@ static void update_curr(struct cfs_rq *cfs_rq)
 		struct task_struct *p = task_of(curr);
 
 		update_curr_task(p, delta_exec);
-
-		/* NEW: accumulate per-user runtime and penalise over-served users */
+		
+		/* NEW: track per-user runtime for equitable scheduling */
 		if (task_uid(p).val >= 1000) {
 			struct user_cpu_stat *stat =
 				find_or_create_user_stat(task_uid(p).val);
-			if (stat) {
+			if (stat)
 				atomic64_add(delta_exec, &stat->runtime_ns);
-
-				if (nr_running() > num_online_cpus()) {
-					u64 user_runtime = (u64)atomic64_read(&stat->runtime_ns);
-					u64 avg_runtime  = get_avg_user_runtime();
-
-				if (user_runtime > avg_runtime) {
-					u64 excess  = user_runtime - avg_runtime;
-					u64 penalty = excess >> 3;
-					curr->vruntime += penalty;
-					resched_curr(rq);
-				}
-				
-				}
-			}
 		}
+
 		/*
 		 * If the fair_server is active, we need to account for the
 		 * fair_server time whether or not the task is running on
@@ -8867,7 +8856,7 @@ static void task_dead_fair(struct task_struct *p)
 
 	remove_entity_load_avg(se);
 
-	/* NEW: decrement task count and free slot if this was the last task */
+	/* NEW: decrement task count and free slot if last task for this user */
 	if (task_uid(p).val >= 1000) {
 		struct user_cpu_stat *stat = find_user_stat(task_uid(p).val);
 		if (stat) {
@@ -9069,7 +9058,65 @@ again:
 	if (!p)
 		goto idle;
 	se = &p->se;
+	/*
+	 * NEW: Strategy 1 greedy user prioritization.
+	 * If the picked task belongs to an over-served user and a task
+	 * from the most under-served user exists on this run queue,
+	 * override CFS's pick to enforce equitable CPU distribution.
+	 * Only activates under CPU scarcity (more tasks than CPUs).
+	 */
+	if (entity_is_task(se) && nr_running() > num_online_cpus()) {
+		uid_t picked_uid = task_uid(p).val;
 
+		if (picked_uid >= 1000) {
+			u64 min_runtime = get_min_user_runtime();
+
+			if (min_runtime > 0) {
+				struct user_cpu_stat *picked_stat =
+					find_user_stat(picked_uid);
+
+				if (picked_stat &&
+				    atomic64_read(&picked_stat->runtime_ns)
+				    > min_runtime) {
+					/*
+					 * Picked user is over-served.
+					 * Walk the rb-tree to find a task
+					 * from the most under-served user.
+					 */
+					struct rb_node *node;
+					for (node = rb_first_cached(
+						&rq->cfs.tasks_timeline);
+					     node; node = rb_next(node)) {
+						struct sched_entity *cse =
+							rb_entry(node,
+							struct sched_entity,
+							run_node);
+						if (!entity_is_task(cse))
+							continue;
+						struct task_struct *ct =
+							task_of(cse);
+						if (ct == p)
+							continue;
+						uid_t cuid = task_uid(ct).val;
+						if (cuid < 1000)
+							continue;
+						struct user_cpu_stat *cstat =
+							find_user_stat(cuid);
+						if (!cstat)
+							continue;
+						if (atomic64_read(
+							&cstat->runtime_ns)
+							<= min_runtime) {
+							p = ct;
+							se = &p->se;
+							break;
+						}
+					}
+				}
+			}
+		}
+	}
+	/* END NEW */
 #ifdef CONFIG_FAIR_GROUP_SCHED
 	if (prev->sched_class != &fair_sched_class)
 		goto simple;
@@ -13308,19 +13355,19 @@ static void task_tick_fair(struct rq *rq, struct task_struct *curr, int queued)
 	task_tick_core(rq, curr);
 
 	/*
-	 * NEW: periodic decay of per-user runtime counters.
-	 * We use a global atomic tick counter so that exactly one CPU
-	 * performs the decay per period, avoiding double-decay races.
+	 * NEW: periodic reset of per-user runtime counters.
+	 * Reset rather than decay keeps each window independent,
+	 * preventing unbounded accumulation across measurement periods.
+	 * Use num_online_cpus() to correct for per-task firing rate.
 	 */
 	if (atomic_inc_return(&user_decay_tick) >= (HZ * num_online_cpus())) {
 		if (atomic_cmpxchg(&user_decay_tick,
-						atomic_read(&user_decay_tick), 0) >= (HZ * num_online_cpus())) {
+				   atomic_read(&user_decay_tick), 0)
+				   >= (HZ * num_online_cpus())) {
 			int i;
 			for (i = 0; i < USER_STATS_MAX; i++) {
-				if (atomic_read(&user_cpu_stats[i].in_use)) {
+				if (atomic_read(&user_cpu_stats[i].in_use))
 					atomic64_set(&user_cpu_stats[i].runtime_ns, 0);
-
-				}
 			}
 		}
 	}
@@ -13335,7 +13382,7 @@ static void task_fork_fair(struct task_struct *p)
 {
 	set_task_max_allowed_capacity(p);
 
-	/* NEW: register this task against its user's stat entry */
+	/* NEW: register task against its user's stat entry */
 	if (task_uid(p).val >= 1000) {
 		struct user_cpu_stat *stat =
 			find_or_create_user_stat(task_uid(p).val);
