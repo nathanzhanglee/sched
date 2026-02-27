@@ -163,7 +163,7 @@ late_initcall(sched_fair_sysctl_init);
 
 /* -------- Per-user CPU accounting for equitable scheduling -------- */
 #define USER_STATS_MAX 64
-#define USER_PENALTY_SHIFT 3  /* penalty = excess >> 3, tune this if needed */
+#define USER_DECAY_SHIFT  1           
 
 struct user_cpu_stat {
     atomic_t    in_use;
@@ -175,8 +175,6 @@ struct user_cpu_stat {
 static struct user_cpu_stat user_cpu_stats[USER_STATS_MAX];
 
 static atomic_t user_decay_tick = ATOMIC_INIT(0);
-#define USER_DECAY_PERIOD (HZ)        /* decay roughly once per second */
-#define USER_DECAY_SHIFT  1           /* halve all runtimes on each decay */
 
 static struct user_cpu_stat *find_user_stat(uid_t uid)
 {
@@ -1306,12 +1304,13 @@ static void update_curr(struct cfs_rq *cfs_rq)
 					u64 user_runtime = (u64)atomic64_read(&stat->runtime_ns);
 					u64 avg_runtime  = get_avg_user_runtime();
 
-					if (user_runtime > avg_runtime) {
-						u64 excess  = user_runtime - avg_runtime;
-						u64 penalty = excess >> USER_PENALTY_SHIFT;
-						curr->vruntime += penalty;
-						resched_curr(rq);
-					}
+				if (user_runtime > avg_runtime) {
+					u64 excess  = user_runtime - avg_runtime;
+					u64 penalty = excess >> 3;
+					curr->vruntime += penalty;
+					resched_curr(rq);
+				}
+				
 				}
 			}
 		}
@@ -13314,9 +13313,9 @@ static void task_tick_fair(struct rq *rq, struct task_struct *curr, int queued)
 	 * We use a global atomic tick counter so that exactly one CPU
 	 * performs the decay per period, avoiding double-decay races.
 	 */
-	if (atomic_inc_return(&user_decay_tick) >= USER_DECAY_PERIOD) {
-		if (atomic_cmpxchg(&user_decay_tick, 
-                               atomic_read(&user_decay_tick), 0) >= USER_DECAY_PERIOD) {
+	if (atomic_inc_return(&user_decay_tick) >= (HZ * num_online_cpus())) {
+		if (atomic_cmpxchg(&user_decay_tick,
+						atomic_read(&user_decay_tick), 0) >= (HZ * num_online_cpus())) {
 			int i;
 			for (i = 0; i < USER_STATS_MAX; i++) {
 				if (atomic_read(&user_cpu_stats[i].in_use)) {
